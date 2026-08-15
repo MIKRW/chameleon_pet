@@ -2,13 +2,11 @@
   const root = document.documentElement;
   const themeToggle = document.getElementById('theme-toggle');
 
-  const THEME_PALETTES = {
-    light: null, // use the chameleon's default palette
-    dark: {
-      body: '#7fd99a',
-      bodyLight: '#bff2cf',
-      bodyDark: '#2f5c40',
-    },
+  // Maps the site's light/dark theme to a named palette from
+  // chameleon-themes.js — see that file to add or tweak moods.
+  const PET_THEME_FOR_SITE_THEME = {
+    light: 'moss',
+    dark: 'midnight',
   };
 
   function applyTheme(theme) {
@@ -18,7 +16,7 @@
       root.removeAttribute('data-theme');
     }
     if (window.__chameleonPetInstance) {
-      window.__chameleonPetInstance.setPalette(THEME_PALETTES[theme]);
+      window.__chameleonPetInstance.setTheme(PET_THEME_FOR_SITE_THEME[theme]);
     }
   }
 
