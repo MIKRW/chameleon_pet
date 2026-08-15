@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chameleon Pet — Demo</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Placeholder Portfolio</h1>
+    <button id="theme-toggle" data-chameleon-target="theme">Toggle Theme</button>
+  </header>
+
+  <main>
+    <p>
+      This is a placeholder page for testing the chameleon desktop pet in isolation,
+      before it gets wired into the real portfolio site. The buttons below stand in
+      for the real theme / resume / email buttons — they're tagged with
+      <code>data-chameleon-target</code> so the pet can find them on any page.
+    </p>
+
+    <div class="actions">
+      <a class="button" href="#" id="resume-download" data-chameleon-target="resume" download>
+        Download Resume
+      </a>
+      <a class="button" href="mailto:someone@example.com" id="email-link" data-chameleon-target="email">
+        Email Me
+      </a>
+    </div>
+  </main>
+
+  <footer>Click the chameleon, drag it around, or just watch it wander.</footer>
+
+  <script src="chameleon-pet.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
