@@ -7,12 +7,18 @@
 (function (global) {
   'use strict';
 
-  const WIDTH = 40;
-  const HEIGHT = 24;
+  // Extra buffer width past the body so a full comedic tongue extension
+  // has room to draw without getting clipped at the canvas edge. Extra
+  // height below the ground line gives the perched tail-hook (see the
+  // tail block below) room to dip under the edge it's gripping.
+  const WIDTH = 72;
+  const HEIGHT = 30;
   // The point in buffer-space (feet on the ground line) that the bootstrap
   // rotates/mirrors the sprite around, so it pivots on its feet rather than
-  // its bounding-box center when oriented onto a side or top edge.
-  const ANCHOR_X = WIDTH / 2;
+  // its bounding-box center when oriented onto a side or top edge. Fixed
+  // at the body's own center (not WIDTH / 2) so widening the buffer for
+  // tongue overflow doesn't shift the body relative to the pet's anchor.
+  const ANCHOR_X = 20;
   const ANCHOR_Y = 21;
 
   function lerpColor(hexA, hexB, t) {
@@ -64,15 +70,27 @@
 
     // Tail: tight double-coil spiral (thin line reads as sleeker/more
     // deliberate than a single loose loop), drawn first so the body
-    // silhouette overlaps its base.
+    // silhouette overlaps its base. While perched, the same base instead
+    // hooks *down* past the ground line (y > ANCHOR_Y) to grip the edge
+    // it's sitting on — since the whole sprite is already rotated/mirrored
+    // to match whichever side of the element it's on (see the shared
+    // ChameleonPath angle convention), this one hook shape automatically
+    // reads as wrapping the correct edge without any per-side art.
     bctx.strokeStyle = darkColor;
     bctx.lineWidth = 2;
     bctx.lineCap = 'round';
     bctx.beginPath();
-    bctx.moveTo(10, 17.5);
-    bctx.bezierCurveTo(4, 18, 0.5, 14.5, 2, 11);
-    bctx.bezierCurveTo(3, 8.5, 6.5, 8, 6.5, 10.5);
-    bctx.bezierCurveTo(6.5, 12, 4.5, 12, 4.5, 10.3);
+    if (pose.perched) {
+      bctx.moveTo(10, 17.5);
+      bctx.bezierCurveTo(6, 19.5, 3, 21.5, 3, 24.5);
+      bctx.bezierCurveTo(3, 27, 6, 27.7, 7.7, 25.8);
+      bctx.bezierCurveTo(8.6, 24.7, 7.3, 23.7, 5.8, 24.2);
+    } else {
+      bctx.moveTo(10, 17.5);
+      bctx.bezierCurveTo(4, 18, 0.5, 14.5, 2, 11);
+      bctx.bezierCurveTo(3, 8.5, 6.5, 8, 6.5, 10.5);
+      bctx.bezierCurveTo(6.5, 12, 4.5, 12, 4.5, 10.3);
+    }
     bctx.stroke();
 
     // Legs: thin and slightly forward-angled (a low, stalking stance
@@ -165,11 +183,21 @@
     bctx.ellipse(32.8, 8.5, 0.5, 1.6, 0, 0, Math.PI * 2);
     bctx.fill();
 
-    // Tongue.
+    // Tongue: length/speed/shape all come from the behavior's chosen
+    // tongue mode (see TONGUE_MODES in chameleon-behavior.js) — "original"
+    // is a plain symmetric ping-pong, the others snap out fast (eased,
+    // within the first snapT of the cycle) and relax back in slower.
     if (pose.tongueActive) {
       const t = pose.tongueT || 0;
-      const extend = t < 0.5 ? t * 2 : (1 - t) * 2;
-      const len = 13 * extend;
+      const snapT = pose.tongueSnapT != null ? pose.tongueSnapT : 0.5;
+      const extend = pose.tongueEase
+        ? t < snapT
+          ? Math.sin((t / snapT) * (Math.PI / 2))
+          : (1 - t) / (1 - snapT)
+        : t < 0.5
+          ? t * 2
+          : (1 - t) * 2;
+      const len = (pose.tongueLen != null ? pose.tongueLen : 13) * extend;
       bctx.strokeStyle = p.tongue;
       bctx.lineWidth = 1.1;
       bctx.beginPath();

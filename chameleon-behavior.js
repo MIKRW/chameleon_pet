@@ -19,6 +19,8 @@
  *   world.edgeMargin()     -> number (inset of the walkable loop from the true window edge)
  *   world.targetRect(key) -> DOMRect | null   (null if not present/visible)
  *   world.targetKeys()    -> string[]
+ *   world.elementAt(x, y) -> { rect, ref } | null   (perch candidate under a drop point; ref is opaque)
+ *   world.rectForRef(ref) -> DOMRect | null   (re-queries a perch's rect each frame; null if removed)
  *
  * Reactions to arriving at / clicking a watched target are looked up from
  * ChameleonActions (this file only knows *when* to fire them).
@@ -32,7 +34,8 @@
     SEEK: 'seek',
     ON_TARGET: 'on_target',
     DRAGGING: 'dragging',
-    RETURNING: 'returning', // easing back onto the track after being dropped
+    RETURNING: 'returning', // easing back onto the track (or a perch point) after being dropped
+    PERCHED: 'perched', // stuck to an element's edge, motionless, until picked up again
   };
 
   // How long the pet commits to a walking direction before reversing, in
@@ -46,6 +49,17 @@
   // frame (higher = snappier corners, lower = lazier/more of a swing).
   const ANGLE_EASE_RATE = 9;
 
+  // Tongue-flick presets: how far it reaches (len), how fast the whole
+  // out-and-back cycle runs (speed, in tongueT units/sec), and the shape
+  // of the motion — "original" is a plain symmetric ping-pong, the other
+  // two snap out fast (within the first snapT of the cycle, eased) and
+  // relax back in slower, just to differing degrees.
+  const TONGUE_MODES = {
+    original: { speed: 3.2, len: 13, ease: false, snapT: 0.5 },
+    middle: { speed: 2.4, len: 21, ease: true, snapT: 0.35 },
+    snappy: { speed: 3.2, len: 30, ease: true, snapT: 0.35 },
+  };
+
   function rand(min, max) {
     return min + Math.random() * (max - min);
   }
@@ -57,7 +71,9 @@
   class ChameleonBehavior {
     constructor(world, config) {
       this.world = world;
-      this.config = config; // { wanderSpeed }
+      this.config = config; // { wanderSpeed, tongueMode }
+      this.tongueMode = TONGUE_MODES[config && config.tongueMode] || TONGUE_MODES.middle;
+      this._activeTongueMode = this.tongueMode; // mode of the in-flight (or most recent) flick
       this.reducedMotion =
         global.matchMedia && global.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
@@ -92,6 +108,9 @@
       this._pendingReaction = null;
 
       this._returnTarget = null;
+      this._returningToPerch = false;
+      this._perchRef = null; // opaque DOM handle from world.elementAt, only ever passed back to world.rectForRef
+      this._perch = null; // { edge, angle, fracX, fracY } — position on the perched element's box, in fractions of its size
       this._dragAnchor = { x: 0, y: 0 }; // offset from pointer to sprite anchor while dragging
 
       this._api = {
@@ -115,6 +134,30 @@
     _nearestPoint(x, y) {
       const vp = this.world.viewport();
       return global.ChameleonPath.nearestS(vp.w, vp.h, this.world.edgeMargin(), x, y);
+    }
+
+    // Treats an arbitrary element's box like a miniature viewport and finds
+    // the nearest point on *its* perimeter to (this.x, this.y) — reusing
+    // the same edge/angle convention the window-perimeter walk uses, so a
+    // perch on an element's top/bottom/left/right reads exactly like
+    // standing on the matching window edge. Stored as fractions of the
+    // box's own size (not absolute px) so it can be re-derived every frame
+    // as the element scrolls or resizes.
+    _computePerchTarget(rect) {
+      const local = global.ChameleonPath.nearestS(rect.width, rect.height, 0, this.x - rect.left, this.y - rect.top);
+      return {
+        edge: local.edge,
+        angle: local.angle,
+        fracX: rect.width ? local.x / rect.width : 0,
+        fracY: rect.height ? local.y / rect.height : 0,
+      };
+    }
+
+    _perchPoint(rect) {
+      return {
+        x: rect.left + this._perch.fracX * rect.width,
+        y: rect.top + this._perch.fracY * rect.height,
+      };
     }
 
     // Picks the next direction-hold duration. Excludes whichever intervals
@@ -178,13 +221,15 @@
     onClickedSelf() {
       this.fadeT = 0.6;
       this.fadeDir = -1;
-      this.flickTongue();
+      this.flickTongue('snappy');
     }
 
     // ---------- pointer / drag ----------
 
     onPointerDown(clientX, clientY) {
       if (this.state === STATE.RETURNING) return;
+      this._perchRef = null;
+      this._perch = null;
       this.state = STATE.DRAGGING;
       this._dragAnchor.x = clientX - this.x;
       this._dragAnchor.y = clientY - this.y;
@@ -201,9 +246,24 @@
       this._rawAngle = 0; // held freely — not pressed against any edge while dragging
     }
 
+    // Dropped: if the pet's feet landed on a suitably large element (per
+    // world.elementAt), ease onto the nearest point on *that* element's
+    // edge and stick there; otherwise ease back onto the window perimeter
+    // as before. Either way the approach is a RETURNING tween — only what
+    // happens on arrival differs (see the RETURNING case in update()).
     onPointerUp() {
       if (this.state !== STATE.DRAGGING) return;
-      this._returnTarget = this._nearestPoint(this.x, this.y);
+      const found = this.world.elementAt && this.world.elementAt(this.x, this.y);
+      if (found) {
+        this._perchRef = found.ref;
+        this._perch = this._computePerchTarget(found.rect);
+        const p = this._perchPoint(found.rect);
+        this._returnTarget = { x: p.x, y: p.y, angle: this._perch.angle };
+        this._returningToPerch = true;
+      } else {
+        this._returnTarget = this._nearestPoint(this.x, this.y);
+        this._returningToPerch = false;
+      }
       this.state = STATE.RETURNING;
     }
 
@@ -211,8 +271,11 @@
 
     // Starts a tongue-flick; a no-op while one is already mid-flight so
     // rapid triggers (e.g. spam-clicking the pet) don't restart the tween.
-    flickTongue() {
+    // Optional modeName overrides the configured default for just this
+    // flick (e.g. clicking the pet directly triggers the snappy preset).
+    flickTongue(modeName) {
       if (this.tongueActive) return;
+      this._activeTongueMode = (modeName && TONGUE_MODES[modeName]) || this.tongueMode;
       this.tongueActive = true;
       this.tongueT = 0;
     }
@@ -326,10 +389,15 @@
           const dist = Math.hypot(dx, dy);
           this._rawAngle = this._returnTarget.angle;
           if (dist < 3) {
-            this.s = this._returnTarget.s;
             this.x = this._returnTarget.x;
             this.y = this._returnTarget.y;
-            this.state = STATE.WANDER;
+            if (this._returningToPerch) {
+              this.state = STATE.PERCHED;
+              this.bob = 0;
+            } else {
+              this.s = this._returnTarget.s;
+              this.state = STATE.WANDER;
+            }
           } else {
             const speed = 260;
             this.x += (dx / dist) * speed * dt;
@@ -338,11 +406,34 @@
           }
           break;
         }
+
+        case STATE.PERCHED: {
+          if (this._perchRef) {
+            const rect = this.world.rectForRef(this._perchRef);
+            if (rect) {
+              const p = this._perchPoint(rect);
+              this.x = p.x;
+              this.y = p.y;
+              this._rawAngle = this._perch.angle;
+            } else {
+              // The element vanished from under it (e.g. a re-render) —
+              // release back onto the window perimeter rather than being
+              // stuck tracking a dead reference.
+              this._perchRef = null;
+              this._perch = null;
+              this._returnTarget = this._nearestPoint(this.x, this.y);
+              this._returningToPerch = false;
+              this.state = STATE.RETURNING;
+            }
+          }
+          this.bob = 0;
+          break;
+        }
       }
 
       // Tongue animation, independent of state.
       if (this.tongueActive) {
-        this.tongueT += dt * 3.2;
+        this.tongueT += dt * this._activeTongueMode.speed;
         if (this.tongueT >= 1) {
           this.tongueT = 0;
           this.tongueActive = false;
@@ -380,12 +471,17 @@
         walkFrame: this.walkFrame,
         isWalking:
           this.state === STATE.LAP || this.state === STATE.WANDER || this.state === STATE.SEEK,
+        perched: this.state === STATE.PERCHED,
         tongueActive: this.tongueActive,
         tongueT: this.tongueT,
+        tongueLen: this._activeTongueMode.len,
+        tongueEase: this._activeTongueMode.ease,
+        tongueSnapT: this._activeTongueMode.snapT,
         fadeT: this.fadeT,
       };
     }
   }
 
+  ChameleonBehavior.TONGUE_MODES = TONGUE_MODES;
   global.ChameleonBehavior = ChameleonBehavior;
 })(window);

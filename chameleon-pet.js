@@ -45,6 +45,7 @@
     scale: 6, // internal-pixel -> screen-pixel multiplier
     edgeMargin: 28, // px inset of the walkable perimeter from the window's true edge
     wanderSpeed: 55, // px/sec
+    tongueMode: 'original', // 'original' | 'middle' | 'snappy' — see TONGUE_MODES in chameleon-behavior.js
     palette: (global.ChameleonThemes && global.ChameleonThemes.shadow) || FALLBACK_PALETTE,
     targets: {
       theme: '[data-chameleon-target="theme"], #theme-toggle',
@@ -73,8 +74,13 @@
         edgeMargin: () => this.config.edgeMargin,
         targetRect: (key) => this._targetRect(key),
         targetKeys: () => Object.keys(this.config.targets),
+        elementAt: (x, y) => this._elementAt(x, y),
+        rectForRef: (ref) => (document.contains(ref) ? ref.getBoundingClientRect() : null),
       };
-      this.behavior = new global.ChameleonBehavior(world, { wanderSpeed: this.config.wanderSpeed });
+      this.behavior = new global.ChameleonBehavior(world, {
+        wanderSpeed: this.config.wanderSpeed,
+        tongueMode: this.config.tongueMode,
+      });
 
       this._bindEvents();
 
@@ -128,6 +134,20 @@
       const rect = el.getBoundingClientRect();
       if (rect.width === 0 && rect.height === 0) return null;
       return rect;
+    }
+
+    // Finds whatever's under (x, y) for a perch drop, ignoring the pet's
+    // own hit-area (temporarily made click-through so it doesn't just find
+    // itself) and skipping anything too small/generic to sensibly perch on.
+    _elementAt(x, y) {
+      const prevPointerEvents = this.hitEl.style.pointerEvents;
+      this.hitEl.style.pointerEvents = 'none';
+      const el = document.elementFromPoint(x, y);
+      this.hitEl.style.pointerEvents = prevPointerEvents;
+      if (!el || el === document.body || el === document.documentElement) return null;
+      const rect = el.getBoundingClientRect();
+      if (rect.width < 40 || rect.height < 24) return null;
+      return { rect, ref: el };
     }
 
     _bindEvents() {
@@ -247,6 +267,13 @@
     setTheme(name) {
       const theme = global.ChameleonThemes && global.ChameleonThemes[name];
       this.setPalette(theme || null);
+    }
+
+    // Switches the tongue-flick preset ('original' | 'middle' | 'snappy')
+    // at runtime; falls back to 'middle' for an unrecognized name.
+    setTongueMode(name) {
+      this.behavior.tongueMode =
+        global.ChameleonBehavior.TONGUE_MODES[name] || global.ChameleonBehavior.TONGUE_MODES.middle;
     }
 
     destroy() {
