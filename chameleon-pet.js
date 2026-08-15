@@ -43,7 +43,7 @@
 
   const DEFAULT_CONFIG = {
     scale: 6, // internal-pixel -> screen-pixel multiplier
-    groundOffset: 24, // px from bottom of viewport the pet's feet rest on
+    edgeMargin: 28, // px inset of the walkable perimeter from the window's true edge
     wanderSpeed: 55, // px/sec
     palette: (global.ChameleonThemes && global.ChameleonThemes.shadow) || FALLBACK_PALETTE,
     targets: {
@@ -66,11 +66,11 @@
       this._lastTime = performance.now();
 
       this._buildDom();
-      this.resize(); // establishes viewW/viewH/groundY before behavior reads them
+      this.resize(); // establishes viewW/viewH before behavior reads them
 
       const world = {
         viewport: () => ({ w: this.viewW, h: this.viewH }),
-        groundY: () => this.groundY,
+        edgeMargin: () => this.config.edgeMargin,
         targetRect: (key) => this._targetRect(key),
         targetKeys: () => Object.keys(this.config.targets),
       };
@@ -176,8 +176,6 @@
       this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       this.viewW = cssW;
       this.viewH = cssH;
-      this.groundY = cssH - this.config.groundOffset;
-      if (this.behavior) this.behavior.y = Math.min(this.behavior.y, this.groundY);
     }
 
     _bgSampleColor() {
@@ -201,26 +199,31 @@
 
       const sw = global.ChameleonSprite.WIDTH * this.config.scale;
       const sh = global.ChameleonSprite.HEIGHT * this.config.scale;
-      const dx = pose.x - sw / 2;
-      const dy = pose.y - sh + pose.bob;
+      const anchorX = global.ChameleonSprite.ANCHOR_X * this.config.scale;
+      const anchorY = global.ChameleonSprite.ANCHOR_Y * this.config.scale;
 
+      // Pivot on the sprite's feet, not its bounding-box corner, so
+      // rotating onto a side/top edge and mirroring for direction both
+      // read as the creature turning in place rather than sliding.
       ctx.imageSmoothingEnabled = false;
       ctx.save();
+      ctx.translate(pose.x, pose.y);
+      ctx.rotate(pose.angle);
+      ctx.translate(0, -pose.bob);
+      if (pose.mirror) ctx.scale(-1, 1);
       ctx.globalAlpha = 1 - pose.fadeT * 0.85; // never fully invisible/unusable
-      if (pose.facing === -1) {
-        ctx.translate(dx + sw, dy);
-        ctx.scale(-1, 1);
-        ctx.drawImage(this.buffer, 0, 0, sw, sh);
-      } else {
-        ctx.drawImage(this.buffer, dx, dy, sw, sh);
-      }
+      ctx.drawImage(this.buffer, -anchorX, -anchorY, sw, sh);
       ctx.restore();
 
-      // Keep hit-area synced to the sprite's on-screen box.
-      this.hitEl.style.width = sw + 'px';
-      this.hitEl.style.height = sh + 'px';
-      this.hitEl.style.left = dx + 'px';
-      this.hitEl.style.top = dy + 'px';
+      // Hit-area: a generous axis-aligned square centered on the anchor —
+      // exact rotated bounds aren't worth tracking for an invisible
+      // pointer target, this just needs to comfortably cover the sprite
+      // at any of the four edge orientations.
+      const hitSize = Math.max(sw, sh);
+      this.hitEl.style.width = hitSize + 'px';
+      this.hitEl.style.height = hitSize + 'px';
+      this.hitEl.style.left = pose.x - hitSize / 2 + 'px';
+      this.hitEl.style.top = pose.y - hitSize / 2 + 'px';
     }
 
     _loop(now) {

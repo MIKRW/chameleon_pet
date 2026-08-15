@@ -9,6 +9,11 @@
 
   const WIDTH = 40;
   const HEIGHT = 24;
+  // The point in buffer-space (feet on the ground line) that the bootstrap
+  // rotates/mirrors the sprite around, so it pivots on its feet rather than
+  // its bounding-box center when oriented onto a side or top edge.
+  const ANCHOR_X = WIDTH / 2;
+  const ANCHOR_Y = 21;
 
   function lerpColor(hexA, hexB, t) {
     const a = hexToRgb(hexA);
@@ -178,5 +183,5 @@
     }
   }
 
-  global.ChameleonSprite = { WIDTH, HEIGHT, draw };
+  global.ChameleonSprite = { WIDTH, HEIGHT, ANCHOR_X, ANCHOR_Y, draw };
 })(window);

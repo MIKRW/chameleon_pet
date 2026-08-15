@@ -1,30 +1,50 @@
 /**
- * ChameleonBehavior — the state machine: idle/wander/seek/on-target/
- * dragging/falling, tongue-flick and camouflage-fade tweens, and pointer
- * handling. Knows nothing about the DOM beyond a small `world` interface
- * injected at construction — it never queries elements or draws pixels
- * itself, so it can't accidentally grow page-specific or rendering logic.
+ * ChameleonBehavior — the state machine: an initial full lap of the
+ * window's perimeter, then continuous back-and-forth patrolling that
+ * reverses direction at randomized intervals, plus seeking/reacting to
+ * watched targets, dragging, and returning to the track after a drop.
  *
- * `world` (implemented by chameleon-pet.js) must provide:
- *   viewport()        -> { w, h }
- *   groundY()         -> number
- *   targetRect(key)   -> DOMRect | null   (null if not present/visible)
- *   targetKeys()      -> string[]
+ * Movement follows ChameleonPath's perimeter loop (see that file for the
+ * geometry) rather than a fixed ground line, so the pet walks the full
+ * border of the window — bottom, up one side, across the top, down the
+ * other side — always oriented feet-first into whichever edge it's on.
+ * Rotation is eased toward the path's angle every frame (see _rawAngle /
+ * lerpAngle below) so corners read as a pivot rather than a snap; no
+ * separate hand-drawn corner sprites are needed for that.
+ *
+ * Knows nothing about the DOM beyond a small `world` interface injected
+ * at construction — it never queries elements or draws pixels itself.
+ *
+ *   world.viewport()      -> { w, h }
+ *   world.edgeMargin()     -> number (inset of the walkable loop from the true window edge)
+ *   world.targetRect(key) -> DOMRect | null   (null if not present/visible)
+ *   world.targetKeys()    -> string[]
  *
  * Reactions to arriving at / clicking a watched target are looked up from
- * ChameleonActions (chameleon-behavior.js only knows *when* to fire them).
+ * ChameleonActions (this file only knows *when* to fire them).
  */
 (function (global) {
   'use strict';
 
   const STATE = {
-    IDLE: 'idle',
-    WANDER: 'wander',
+    LAP: 'lap', // one full establishing loop of the perimeter on startup
+    WANDER: 'wander', // steady-state patrol, reversing direction periodically
     SEEK: 'seek',
     ON_TARGET: 'on_target',
     DRAGGING: 'dragging',
-    FALLING: 'falling',
+    RETURNING: 'returning', // easing back onto the track after being dropped
   };
+
+  // How long the pet commits to a walking direction before reversing, in
+  // seconds, quantized to 15s steps from 15s to 2 minutes. The "don't
+  // repeat within 3 turns" rule (see _pickDirectionInterval) is what keeps
+  // this feeling randomized without ever producing a jittery back-to-back
+  // repeat of the same short or long stretch.
+  const DIRECTION_INTERVALS = [15, 30, 45, 60, 75, 90, 105, 120];
+
+  // How quickly the rendered angle chases the path's "raw" angle each
+  // frame (higher = snappier corners, lower = lazier/more of a swing).
+  const ANGLE_EASE_RATE = 9;
 
   function rand(min, max) {
     return min + Math.random() * (max - min);
@@ -41,12 +61,24 @@
       this.reducedMotion =
         global.matchMedia && global.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-      const vp = world.viewport();
-      this.x = rand(80, Math.max(160, vp.w - 80));
-      this.y = world.groundY();
-      this.facing = 1; // 1 = right, -1 = left
-      this.state = STATE.IDLE;
-      this.stateTimer = rand(1, 3);
+      this.s = 0; // distance along the perimeter loop
+      this.direction = 1; // 1 = clockwise, -1 = counter-clockwise
+      this.mirror = false; // sprite horizontal flip
+      this.angle = 0; // smoothed render angle
+      this._rawAngle = 0; // angle the path/state wants us at right now
+
+      const start = this._pointAt(0);
+      this.x = start.x;
+      this.y = start.y;
+      this.angle = start.angle;
+      this._rawAngle = start.angle;
+
+      this.state = this.reducedMotion ? STATE.WANDER : STATE.LAP;
+      this._lapDistance = 0;
+      this.stateTimer = 0;
+      this._directionTimer = this._pickDirectionInterval();
+      this._recentIntervals = [];
+
       this.walkFrame = 0;
       this.walkFrameTimer = 0;
       this.tongueT = 0; // 0..1 progress of a tongue flick, 0 = retracted
@@ -54,26 +86,87 @@
       this.fadeT = 0; // 0 = fully visible, 1 = fully camouflaged
       this.fadeDir = 0;
       this.bob = 0;
-      this.wanderTargetX = this.x;
+
       this.currentTargetKey = null;
-      this.dragOffset = { x: 0, y: 0 };
-      this.fallVelocity = 0;
+      this._seekS = 0;
       this._pendingReaction = null;
+
+      this._returnTarget = null;
+      this._dragAnchor = { x: 0, y: 0 }; // offset from pointer to sprite anchor while dragging
 
       this._api = {
         flickTongue: () => this.flickTongue(),
         startFade: () => this.startFade(),
       };
+    }
 
-      this._pickNewWanderTarget();
+    // ---------- path helpers (thin wrappers so call sites stay short) ----------
+
+    _pointAt(s) {
+      const vp = this.world.viewport();
+      return global.ChameleonPath.pointAt(vp.w, vp.h, this.world.edgeMargin(), s);
+    }
+
+    _perimeterLength() {
+      const vp = this.world.viewport();
+      return global.ChameleonPath.perimeterLength(vp.w, vp.h, this.world.edgeMargin());
+    }
+
+    _nearestPoint(x, y) {
+      const vp = this.world.viewport();
+      return global.ChameleonPath.nearestS(vp.w, vp.h, this.world.edgeMargin(), x, y);
+    }
+
+    // Picks the next direction-hold duration. Excludes whichever intervals
+    // were used in the last two turns so the same gap can't recur within
+    // any 3 consecutive turns, while still being free random choice
+    // otherwise — the "illusion of randomness without chaos".
+    _pickDirectionInterval() {
+      const pool = DIRECTION_INTERVALS.filter((v) => !this._recentIntervals || !this._recentIntervals.includes(v));
+      const candidates = pool.length ? pool : DIRECTION_INTERVALS;
+      const choice = candidates[Math.floor(Math.random() * candidates.length)];
+      if (!this._recentIntervals) this._recentIntervals = [];
+      this._recentIntervals.push(choice);
+      if (this._recentIntervals.length > 2) this._recentIntervals.shift();
+      return choice;
+    }
+
+    // Moves `s` by dt*speed*dir along the loop and updates x/y/rawAngle
+    // and the walk-cycle frame timer to match.
+    _advanceAlongPath(dt, dir) {
+      const total = this._perimeterLength();
+      this.s = ((this.s + dir * this.config.wanderSpeed * dt) % total + total) % total;
+      const p = this._pointAt(this.s);
+      this.x = p.x;
+      this.y = p.y;
+      this._rawAngle = p.angle;
+      this.mirror = dir === -1;
+
+      this.walkFrameTimer += dt;
+      if (this.walkFrameTimer > 0.18) {
+        this.walkFrameTimer = 0;
+        this.walkFrame = (this.walkFrame + 1) % 2;
+      }
+      this.bob = Math.abs(Math.sin(performance.now() / 120)) * 1.5;
+    }
+
+    // ---------- cosmetic overlays (independent of state/position) ----------
+
+    _maybeTongueFlick(dt) {
+      if (this.reducedMotion || this.tongueActive) return;
+      if (Math.random() < dt * 0.12) this.flickTongue();
+    }
+
+    _maybeFade(dt) {
+      if (this.reducedMotion || this.fadeDir !== 0) return;
+      if (Math.random() < dt * 0.05) this.startFade();
     }
 
     // ---------- reactions from the outside world ----------
 
     // A real click landed on a watched button, wherever the pet currently
-    // is. Fires that target's onClick immediately, and nudges the wander
-    // goal toward it so the pet also walks over when it next gets a
-    // chance (see _maybeSeekTarget).
+    // is. Fires that target's onClick immediately, and queues it to be
+    // walked to next chance the state machine gets (see _maybeSeekTarget).
     reactTo(key) {
       this._pendingReaction = key;
       const recipe = global.ChameleonActions && global.ChameleonActions[key];
@@ -91,34 +184,30 @@
     // ---------- pointer / drag ----------
 
     onPointerDown(clientX, clientY) {
-      if (this.state === STATE.FALLING) return;
+      if (this.state === STATE.RETURNING) return;
       this.state = STATE.DRAGGING;
-      this.dragOffset.x = clientX - this.x;
-      this.dragOffset.y = clientY - this.y;
+      this._dragAnchor.x = clientX - this.x;
+      this._dragAnchor.y = clientY - this.y;
     }
 
     onPointerMove(clientX, clientY) {
       if (this.state !== STATE.DRAGGING) return;
       const vp = this.world.viewport();
-      const nx = clientX - this.dragOffset.x;
-      const ny = clientY - this.dragOffset.y;
-      this.facing = nx > this.x ? 1 : nx < this.x ? -1 : this.facing;
-      this.x = clamp(nx, 20, vp.w - 20);
-      this.y = clamp(ny, 40, vp.h - 10);
+      const nx = clientX - this._dragAnchor.x;
+      const ny = clientY - this._dragAnchor.y;
+      this.mirror = nx < this.x ? true : nx > this.x ? false : this.mirror;
+      this.x = clamp(nx, 10, vp.w - 10);
+      this.y = clamp(ny, 10, vp.h - 10);
+      this._rawAngle = 0; // held freely — not pressed against any edge while dragging
     }
 
     onPointerUp() {
       if (this.state !== STATE.DRAGGING) return;
-      this.state = STATE.FALLING;
-      this.fallVelocity = 0;
+      this._returnTarget = this._nearestPoint(this.x, this.y);
+      this.state = STATE.RETURNING;
     }
 
     // ---------- internal behavior helpers ----------
-
-    _pickNewWanderTarget() {
-      const vp = this.world.viewport();
-      this.wanderTargetX = clamp(rand(40, vp.w - 40), 40, vp.w - 40);
-    }
 
     // Starts a tongue-flick; a no-op while one is already mid-flight so
     // rapid triggers (e.g. spam-clicking the pet) don't restart the tween.
@@ -137,7 +226,7 @@
 
     // Walks toward a watched button: picks _pendingReaction if a real
     // click was observed, otherwise a random target key, so the pet reacts
-    // to actual user activity when there is any instead of only wandering
+    // to actual user activity when there is any instead of only patrolling
     // aimlessly. Returns false (leaving state untouched) if that target
     // isn't in the DOM yet or is hidden, which happens on pages still
     // under construction.
@@ -148,9 +237,9 @@
       this._pendingReaction = null;
       const rect = this.world.targetRect(key);
       if (!rect) return false;
-      const vp = this.world.viewport();
+      const nearest = this._nearestPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
       this.currentTargetKey = key;
-      this.wanderTargetX = clamp(rect.left + rect.width / 2, 30, vp.w - 30);
+      this._seekS = nearest.s;
       this.state = STATE.SEEK;
       return true;
     }
@@ -164,68 +253,57 @@
     // ---------- main update ----------
 
     // Advances the state machine by dt seconds. Each STATE case owns its
-    // own transition logic; the tongue/fade tweens below run every frame
-    // regardless of state since they're independent of movement.
+    // own transition logic; the tongue/fade tweens and angle easing below
+    // run every frame regardless of state.
     update(dt) {
-      const vp = this.world.viewport();
-      const groundY = this.world.groundY();
-
       if (this.reducedMotion) {
-        // Minimal motion: stay idle, still allow drag/click reactions.
-        if (this.state !== STATE.DRAGGING && this.state !== STATE.FALLING) {
-          this.state = STATE.IDLE;
+        if (this.state === STATE.LAP) this.state = STATE.WANDER;
+        if (this.state !== STATE.DRAGGING && this.state !== STATE.RETURNING) {
+          // Stay put; still allow drag/click reactions and cosmetic overlays.
         }
       }
 
       this.stateTimer -= dt;
 
       switch (this.state) {
-        case STATE.IDLE:
-          this.bob = Math.sin(performance.now() / 400) * 1.2;
-          if (this.stateTimer <= 0) {
-            if (this._pendingReaction && this._maybeSeekTarget()) break;
-            if (Math.random() < 0.3 && !this.reducedMotion) {
-              this.flickTongue();
-              this.stateTimer = rand(1, 2);
-            } else if (Math.random() < 0.25 && !this.reducedMotion) {
-              this.startFade();
-              this.stateTimer = rand(3, 5);
-            } else if (!this.reducedMotion) {
-              this._pickNewWanderTarget();
-              this.state = STATE.WANDER;
-              this.stateTimer = rand(3, 7);
-            } else {
-              this.stateTimer = rand(2, 4);
-            }
+        case STATE.LAP: {
+          if (this.reducedMotion) break;
+          this._advanceAlongPath(dt, 1); // establishing lap always runs clockwise
+          this._maybeTongueFlick(dt);
+          this._lapDistance += this.config.wanderSpeed * dt;
+          if (this._lapDistance >= this._perimeterLength()) {
+            this.state = STATE.WANDER;
+            this.direction = 1;
+            this._directionTimer = this._pickDirectionInterval();
           }
+          if (this._pendingReaction) this._maybeSeekTarget();
           break;
+        }
 
-        case STATE.WANDER:
-        case STATE.SEEK: {
-          const dx = this.wanderTargetX - this.x;
-          const dist = Math.abs(dx);
-          if (dist < 4) {
-            if (this.state === STATE.SEEK) {
-              this.state = STATE.ON_TARGET;
-              this.stateTimer = rand(1.5, 2.5);
-              this._runArriveAction();
-            } else {
-              this.state = STATE.IDLE;
-              this.stateTimer = rand(1.5, 4);
-            }
-          } else {
-            this.facing = dx > 0 ? 1 : -1;
-            this.x += this.facing * this.config.wanderSpeed * dt;
-            this.walkFrameTimer += dt;
-            if (this.walkFrameTimer > 0.18) {
-              this.walkFrameTimer = 0;
-              this.walkFrame = (this.walkFrame + 1) % 2;
-            }
-            this.bob = Math.abs(Math.sin(performance.now() / 120)) * 1.5;
+        case STATE.WANDER: {
+          if (this.reducedMotion) break;
+          this._directionTimer -= dt;
+          if (this._directionTimer <= 0) {
+            this.direction *= -1;
+            this._directionTimer = this._pickDirectionInterval();
           }
-          if (this.stateTimer <= 0 && this.state === STATE.WANDER) {
-            this.state = STATE.IDLE;
-            this.stateTimer = rand(1.5, 4);
+          this._advanceAlongPath(dt, this.direction);
+          this._maybeTongueFlick(dt);
+          this._maybeFade(dt);
+          if (this._pendingReaction) this._maybeSeekTarget();
+          break;
+        }
+
+        case STATE.SEEK: {
+          const total = this._perimeterLength();
+          const { dir, dist } = global.ChameleonPath.shortestDirection(this.s, this._seekS, total);
+          if (dist < 4) {
+            this.state = STATE.ON_TARGET;
+            this.stateTimer = rand(1.5, 2.5);
+            this._runArriveAction();
+          } else {
+            this._advanceAlongPath(dt, dir);
+            this._maybeTongueFlick(dt);
           }
           break;
         }
@@ -234,8 +312,7 @@
           this.bob = Math.sin(performance.now() / 350) * 1;
           if (this.stateTimer <= 0) {
             this.currentTargetKey = null;
-            this.state = STATE.IDLE;
-            this.stateTimer = rand(1, 2);
+            this.state = STATE.WANDER;
           }
           break;
 
@@ -243,15 +320,24 @@
           this.bob = 0;
           break;
 
-        case STATE.FALLING:
-          this.fallVelocity += 900 * dt;
-          this.y += this.fallVelocity * dt;
-          if (this.y >= groundY) {
-            this.y = groundY;
-            this.state = STATE.IDLE;
-            this.stateTimer = rand(0.5, 1);
+        case STATE.RETURNING: {
+          const dx = this._returnTarget.x - this.x;
+          const dy = this._returnTarget.y - this.y;
+          const dist = Math.hypot(dx, dy);
+          this._rawAngle = this._returnTarget.angle;
+          if (dist < 3) {
+            this.s = this._returnTarget.s;
+            this.x = this._returnTarget.x;
+            this.y = this._returnTarget.y;
+            this.state = STATE.WANDER;
+          } else {
+            const speed = 260;
+            this.x += (dx / dist) * speed * dt;
+            this.y += (dy / dist) * speed * dt;
+            this.mirror = dx < 0;
           }
           break;
+        }
       }
 
       // Tongue animation, independent of state.
@@ -275,18 +361,11 @@
         }
       }
 
-      // Occasionally pursue a pending reaction even outside idle's own roll.
-      if (
-        this._pendingReaction &&
-        this.state !== STATE.SEEK &&
-        this.state !== STATE.DRAGGING &&
-        this.state !== STATE.FALLING
-      ) {
-        this._maybeSeekTarget();
-      }
-
-      // Clamp stray positions back into a resized viewport.
-      this.x = clamp(this.x, 10, vp.w - 10);
+      // Ease the rendered rotation toward wherever the path/state wants it
+      // — this is what makes corners (and picking the pet up) read as a
+      // pivot instead of an instant snap.
+      const ease = 1 - Math.exp(-ANGLE_EASE_RATE * dt);
+      this.angle = global.ChameleonPath.lerpAngle(this.angle, this._rawAngle, ease);
     }
 
     // Snapshot consumed by the bootstrap's draw loop: sprite pose plus
@@ -295,10 +374,12 @@
       return {
         x: this.x,
         y: this.y,
-        facing: this.facing,
+        angle: this.angle,
+        mirror: this.mirror,
         bob: this.bob,
         walkFrame: this.walkFrame,
-        isWalking: this.state === STATE.WANDER || this.state === STATE.SEEK,
+        isWalking:
+          this.state === STATE.LAP || this.state === STATE.WANDER || this.state === STATE.SEEK,
         tongueActive: this.tongueActive,
         tongueT: this.tongueT,
         fadeT: this.fadeT,
