@@ -2,10 +2,12 @@
  * ChameleonPet — thin bootstrap. Wires together the other modules and does
  * nothing else:
  *
- *   chameleon-themes.js    - color palettes (data)
- *   chameleon-sprite.js    - pure drawing (pose + palette -> pixels)
- *   chameleon-actions.js   - reaction recipes per target key
- *   chameleon-behavior.js  - state machine (DOM-agnostic)
+ *   chameleon-themes.js     - color palettes (data)
+ *   chameleon-sprite.js     - pure drawing (pose + palette -> pixels)
+ *   chameleon-actions.js    - reaction recipes per target key
+ *   behaviours/*.js         - the state machine's behaviour logic, split by
+ *                             standard / user-interaction / desktop-interaction
+ *   chameleon-behavior.js   - state machine coordinator (DOM-agnostic)
  *   chameleon-pet.js (you are here) - sensing + glue:
  *     - finds/watches site elements (theme/resume/email buttons, or
  *       whatever `targets` selectors are configured)
@@ -15,7 +17,7 @@
  *       and handing it to the sprite module to draw
  *     - exposes the public API (init/setPalette/setTheme/destroy)
  *
- * Load order matters: themes, sprite, actions, behavior, then this file.
+ * Load order matters: themes, sprite, actions, behaviours/*, behavior, then this file.
  *
  * Usage:
  *   ChameleonPet.init();
@@ -42,10 +44,10 @@
   };
 
   const DEFAULT_CONFIG = {
-    scale: 6, // internal-pixel -> screen-pixel multiplier
-    edgeMargin: 28, // px inset of the walkable perimeter from the window's true edge
+    scale: 4, // internal-pixel -> screen-pixel multiplier
+    edgeMargin: 4, // px inset of the walkable perimeter from the window's true edge
     wanderSpeed: 55, // px/sec
-    tongueMode: 'original', // 'original' | 'middle' | 'snappy' — see TONGUE_MODES in chameleon-behavior.js
+    tongueMode: 'original', // 'original' | 'middle' | 'snappy' — see TONGUE_MODES in behaviours/standard-behaviour.js
     palette: (global.ChameleonThemes && global.ChameleonThemes.shadow) || FALLBACK_PALETTE,
     targets: {
       theme: '[data-chameleon-target="theme"], #theme-toggle',
@@ -198,16 +200,38 @@
       this.viewH = cssH;
     }
 
-    _bgSampleColor() {
-      // Approximate "blend into background" using the page/body background.
-      const bodyBg = getComputedStyle(document.body).backgroundColor;
-      return bodyBg && bodyBg !== 'rgba(0, 0, 0, 0)' ? bodyBg : '#ffffff';
-    }
-
     // ---------- render loop ----------
 
     _currentPalette() {
-      return this.paletteOverride || this.config.palette;
+      const base = this.paletteOverride || this.config.palette;
+      return this.behavior.getPalette(base);
+    }
+
+    // Canvas2D always antialiases vector fills/strokes, even with
+    // imageSmoothingEnabled off (that flag only governs how drawImage
+    // scales the buffer up, not how the shapes were rasterized onto it in
+    // the first place). On the large filled shapes (body, crest, casque,
+    // eye turret) that antialiasing shows up as a faint translucent halo
+    // ringing an otherwise-solid area, since almost the whole shape is
+    // already near-opaque — clipping only the extremes (near-0 alpha to
+    // fully transparent, near-255 to fully opaque) removes that ghost
+    // fringe. Thin strokes (legs, tail, tongue, nose/eye accents) are
+    // mid-coverage across most of their width even at full opacity, since
+    // a sub-pixel-wide line can't fully cover a pixel row — clamping their
+    // whole alpha range the same way as the fills would erase most of
+    // those pixels and read as gaps/disconnected segments, so the
+    // untouched middle band here deliberately leaves them soft.
+    _crispEdges() {
+      const w = global.ChameleonSprite.WIDTH;
+      const h = global.ChameleonSprite.HEIGHT;
+      const imageData = this.bctx.getImageData(0, 0, w, h);
+      const data = imageData.data;
+      for (let i = 3; i < data.length; i += 4) {
+        const a = data[i];
+        if (a < 30) data[i] = 0;
+        else if (a > 200) data[i] = 255;
+      }
+      this.bctx.putImageData(imageData, 0, 0);
     }
 
     draw() {
@@ -215,7 +239,8 @@
       ctx.clearRect(0, 0, this.viewW, this.viewH);
 
       const pose = this.behavior.getPose();
-      global.ChameleonSprite.draw(this.bctx, pose, this._currentPalette(), this._bgSampleColor());
+      global.ChameleonSprite.draw(this.bctx, pose, this._currentPalette());
+      this._crispEdges();
 
       const sw = global.ChameleonSprite.WIDTH * this.config.scale;
       const sh = global.ChameleonSprite.HEIGHT * this.config.scale;
@@ -231,7 +256,10 @@
       ctx.rotate(pose.angle);
       ctx.translate(0, -pose.bob);
       if (pose.mirror) ctx.scale(-1, 1);
-      ctx.globalAlpha = 1 - pose.fadeT * 0.85; // never fully invisible/unusable
+      // Camouflage fade (all the way to invisible) and the touch/hold
+      // opacity dip (down to ~30%) are independent effects, so combine
+      // them multiplicatively rather than one overriding the other.
+      ctx.globalAlpha = (1 - pose.fadeT) * pose.touchAlpha;
       ctx.drawImage(this.buffer, -anchorX, -anchorY, sw, sh);
       ctx.restore();
 
@@ -269,11 +297,21 @@
       this.setPalette(theme || null);
     }
 
+    // Same idea as setTheme(), but for the site-responsive mood variants
+    // from chameleon-themes.js's deriveVariant() ('high', 'low',
+    // 'transitionHigh', 'transitionLow', 'speckled', 'placeholder') instead
+    // of a static named theme — each call re-derives from the site's
+    // current colors, so it stays correct across a light/dark toggle.
+    setVariant(name) {
+      const variant = global.ChameleonThemes && global.ChameleonThemes.deriveVariant(name);
+      this.setPalette(variant || null);
+    }
+
     // Switches the tongue-flick preset ('original' | 'middle' | 'snappy')
     // at runtime; falls back to 'middle' for an unrecognized name.
     setTongueMode(name) {
-      this.behavior.tongueMode =
-        global.ChameleonBehavior.TONGUE_MODES[name] || global.ChameleonBehavior.TONGUE_MODES.middle;
+      const modes = global.ChameleonStandardBehaviour.TONGUE_MODES;
+      this.behavior.tongueMode = modes[name] || modes.middle;
     }
 
     destroy() {
